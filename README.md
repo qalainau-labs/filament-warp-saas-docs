@@ -17,6 +17,7 @@ You get a company of your own: switch the plan and watch a page appear and disap
 - [Members and invitations](#members-and-invitations)
 - [Data export and deletion](#data-export-and-deletion)
 - [Usage quotas](#usage-quotas)
+- [AI gateway](#ai-gateway)
 - [Operator panel](#operator-panel)
 - [Events](#events)
 - [Artisan commands](#artisan-commands)
@@ -38,6 +39,7 @@ You get a company of your own: switch the plan and watch a page appear and disap
 | Owners who invite colleagues by email, change roles and cannot remove the last owner | [`Members` page](#members-and-invitations) |
 | A zip of every table and file of a team, and a safe way to delete it all | [`warp-saas:export`, `warp-saas:delete`](#data-export-and-deletion) |
 | “50 AI summaries a month”, a monthly cost per team and a budget for the whole service | [`WarpSaas::meter()`](#usage-quotas) |
+| Every AI feature of the Warp plugins through one place: the models, the prices, the count per team, the plan that allows it | [`app('warp.ai')`](#ai-gateway) |
 | Monthly or yearly invoices paid by bank transfer, reminders before the due date, and the payments recorded by you | [`->billing(Billing::invoice())`](#billing) |
 | One screen where you see every team, change its plan, extend its trial or delete it | [`FilamentWarpSaasAdminPlugin`](#operator-panel) |
 
@@ -1536,11 +1538,14 @@ try {
         callback: fn () => $ai->summarize($project),
         cost: fn ($result) => $result->usage->cost,   // or a number, e.g. 0.002
         meta: ['project_id' => $project->id],
+        estimate: 0.01,                                // optional: what one use may cost, checked against the budget
     );
 } catch (UsageLimitReached $exception) {
     Notification::make()->danger()->title($exception->getMessage())->send();   // a sentence for the user
 }
 ```
+
+`attempt()` **takes a seat** before it calls your function, so two people of the same team who press the button at the same moment cannot both take the last use (see [Seats](#seats-reserve-and-reservation)). Each use needs a cache store with locks (`database`, `redis`, `memcached`, `file`, `array`…, the Laravel default `database` is fine).
 
 ### `Meter`
 
@@ -1555,7 +1560,8 @@ try {
 | `perMinute(?int $times)` | Uses per minute per person (per team when the person is unknown). Uses Laravel's rate limiter. |
 | `ensureAvailable(?Model $tenant = null, ?Authenticatable $user = null, int $quantity = 1)` | Throws `UsageLimitReached` if the next use is not allowed. Defaults: the current tenant and signed-in user. |
 | `record(?Model $tenant = null, ?Authenticatable $user = null, int\|float $cost = 0, int $quantity = 1, array $meta = [])` | Records one use (one row in `warp_saas_usages`). Negative numbers are refused. |
-| `attempt(?Model $tenant = null, ?Authenticatable $user = null, ?Closure $callback = null, int\|float\|Closure $cost = 0, int $quantity = 1, array\|Closure $meta = [])` | `ensureAvailable()` → your function → `record()`, and returns the function's result. **If the function throws, nothing is recorded.** Use named arguments. |
+| `reserve(?Model $tenant = null, ?Authenticatable $user = null, int $quantity = 1, int\|float $estimate = 0, array $meta = []): Reservation` | Checks the same four stops as `ensureAvailable()` and, if they pass, **takes the seat at once**: a row is recorded with the quantity and the estimate as its cost, and counted by every check after it. Close it with `complete()` or `fail()`. See [Seats](#seats-reserve-and-reservation). |
+| `attempt(?Model $tenant = null, ?Authenticatable $user = null, ?Closure $callback = null, int\|float\|Closure $cost = 0, int $quantity = 1, array\|Closure $meta = [], int\|float $estimate = 0)` | `reserve()` → your function → `complete()`, and returns the function's result. The function receives the `Reservation` (a function with no parameters works too). **If the function throws**, the cost it reported with `$reservation->cost(…)` is kept (no use is counted), or, if it reported none, the seat is removed; the exception is thrown on. Use named arguments. |
 | `remaining(?Model $tenant = null): ?int` | Uses left this month (`null` if unlimited). |
 | `usedThisMonth(?Model $tenant = null): array` | `['quantity' => int, 'cost' => float]`. |
 | `reset(?Model $tenant = null): int` | Deletes this month's records of this meter for the tenant, so its monthly count and cost start from 0 again, and returns how many it deleted. Earlier months and other meters stay. For an operator who gives a customer a fresh month, or a demo. |
@@ -1573,9 +1579,44 @@ The *Plan and usage* page leaves out a meter that only holds a shared budget (no
 
 Where the limit comes from, in this order: the team's own value (`WarpSaas::setMeterLimit($tenant, 'ai.summary', limit: 500, budget: 10)`; `resetMeterLimit()` removes it) → `trial:` if the team is on trial → the entry for the team's plan in the meter's array → the plan's own `Plan::meter('ai.summary', limit: 50, budget: 2)` → the single number given to the meter. Pass `null` to mean unlimited, and leave `limit:` or `budget:` out of `setMeterLimit()` to leave that one alone.
 
+### Seats: `reserve()` and `Reservation`
+
+`ensureAvailable()` → your call → `record()` leaves a gap: two requests at the same moment both pass the check, then both record, and a team with 1 use left gets 2 (with 8 at once, 8: we measured it on MySQL and PostgreSQL). `reserve()` closes the gap. It waits for a lock per team and budget (meters that [share a budget](#meter) share the lock), checks the four stops, records the seat, and releases the lock at once — the lock is held for a few milliseconds, never while the AI answers.
+
+```php
+use Qalainau\FilamentWarpSaas\Exceptions\UsageLimitReached;
+
+$reservation = WarpSaas::meter('ai.intake')->reserve($tenant, $user, estimate: 0.02);   // throws UsageLimitReached when used up
+
+try {
+    $response = $ai->read($file);              // the provider charges you here…
+    $reservation->cost($response->cost);       // …so say what it cost as soon as you know
+    $order = $parser->parse($response);        // …and this may still fail
+} catch (Throwable $exception) {
+    $reservation->fail();                      // keeps the reported cost (0 uses), or removes the seat when none was reported
+    throw $exception;
+}
+
+$reservation->complete(cost: $response->cost, meta: ['file' => $file->name]);
+```
+
+| `Reservation` method | What it does |
+| --- | --- |
+| `cost(int\|float $cost): static` | Remembers what the use has cost so far. `fail()` and `complete()` use it when they get no cost. |
+| `complete(int\|float\|null $cost = null, array $meta = []): Usage` | The use is done: the row gets the real cost (or the reported cost, or the estimate) and the meta (on top of the meta given to `reserve()`). |
+| `fail(int\|float\|null $cost = null): ?Usage` | The use failed. With a cost (given here or reported with `cost()`), the row stays with **quantity 0** and that cost and `meta.failed = true`: it counts toward the budget, not toward the monthly limit. With no cost the row is deleted and `null` is returned. |
+| `isClosed(): bool`, `usage(): Usage`, `$quantity`, `$estimate` | The state, the row, and what was reserved. |
+
+- **The budget with an estimate:** `reserve()` stops when *cost this month + estimate > budget*. With no estimate (`0`) it stops when *cost this month ≥ budget*, as `ensureAvailable()` does. Use the estimate when one use can be expensive (a long PDF), so that the last use does not run far past the budget.
+- **Closing twice** does nothing the second time: `complete()` returns the same row, `fail()` does nothing.
+- **A seat that is never closed** (the PHP process died in between) stays with its estimate and `meta.reserved = true`. It is counted, so the meter errs on the side of counting too much. Nothing cleans it up; an operator can see it in `warp_saas_usages` by `meta->reserved`.
+- **The lock needs a shared cache store with locks.** Without one (the `null` store), `reserve()` and `attempt()` throw a `LogicException` instead of going on without a lock. With several web servers, use a store they all share (`database`, `redis`); a `file` store only locks within one server. When the lock is busy for more than `Meter::$lockWaitSeconds` (5), `reserve()` and `attempt()` throw `Qalainau\FilamentWarpSaas\Exceptions\UsageBusy` (it extends `Illuminate\Contracts\Cache\LockTimeoutException`, so code that caught that keeps working). Its message tells the person to wait a moment and try again; uncaught in a request it becomes a 503 with `Retry-After: 5`, not a 500. No usage row is left. Through the AI gateway it becomes `AiUnavailable` with the reason `busy` and a translated `userMessage()`.
+- **Do not call `reserve()` inside a database transaction** you have opened: the seat is not visible to other requests until you commit, so the gap opens again.
+- `ensureAvailable()` and `record()` do not take a seat and work as before (no lock is needed).
+
 ### The four stops, in this order
 
-`ensureAvailable()` checks these in order and throws a message you can show:
+`ensureAvailable()` (and `reserve()`) checks these in order and throws a message you can show:
 
 1. **Uses this month for the team** (`monthlyLimit`): *“This month, “Project summary” can be used up to 20 times, and it has already been used 20 times. You can use it again on December 1.”*
 2. **Money this month for the team** (`monthlyBudget`, or the shared budget of `sharesBudgetWith()`): *“…has reached the amount set for this month.”* The amount itself is not shown.
@@ -1590,13 +1631,108 @@ Where the limit comes from, in this order: the team's own value (`WarpSaas::setM
 
 ### Good to know
 
-- **Two requests at the same moment can both pass the check.** `ensureAvailable()` and `record()` do not lock, because the call to the outside API in between can take seconds and the account row must not be held for that long. The limit can be exceeded by one or two uses, not by a crowd. For a hard cap use `attempt()` with a small `monthlyLimit` margin.
+- **Two requests at the same moment can both pass `ensureAvailable()`**, which does not take a seat. For a hard cap use `attempt()` or `reserve()`. The service-wide budget is not locked (it is a cap on damage, not a precise meter).
 - The *Plan and usage* page shows the uses of this month and a sentence when a meter is used up. It does not show money.
 - `WarpSaas::meters()` lists the registered meters.
 
 ```php
 Schedule::command('warp-saas:prune-usages --months=13')->monthly();   // keeps this month and the 12 before it
 ```
+
+## AI gateway
+
+The AI features of the Warp plugins (Warp Input fills a form from pasted text, Warp Import suggests column matches, …) do not call an AI provider themselves. They ask one **gateway**, bound in the container as `warp.ai`, and show their AI buttons only when it is bound. Warp SaaS is that gateway: it picks the model, takes a [seat](#seats-reserve-and-reservation) on the team's meter, calls the provider with [Laravel AI](https://github.com/laravel/ai), works out the cost from the tokens and records it. A plugin never names a provider or a model, so you change models in one place, and every use is counted per team, per person and per feature.
+
+### Turn it on
+
+Warp SaaS binds `warp.ai` only when at least one model is set — an app that does not use AI keeps every AI button hidden.
+
+```bash
+php artisan vendor:publish --tag=filament-warp-saas-config   # config/filament-warp-saas.php, the 'ai' section
+```
+
+```dotenv
+ANTHROPIC_API_KEY=sk-ant-...            # Laravel AI's key (config/ai.php)
+WARP_AI_MODEL_FAST=claude-haiku-5-5     # quick, cheap work: filling a form, matching columns
+WARP_AI_MODEL_SMART=claude-sonnet-5-5   # harder reading: drawings, long documents
+WARP_AI_CURRENCY_RATE=150               # USD → the currency of your usage records (here yen)
+```
+
+```php
+// config/filament-warp-saas.php
+'ai' => [
+    // ...
+    'plans' => [
+        'lite' => ['input.form_fill' => 50],          // only this feature, 50 uses a month
+        'pro' => ['*' => null],                       // every AI feature, no monthly limit
+    ],
+    'trial_limit' => 10,                             // a team on trial: 10 uses a month of each feature
+    'budget_meter' => 'ai',                          // all AI features share one money budget…
+],
+
+// AppServiceProvider::boot()
+WarpSaas::meter('ai')->monthlyBudget(['lite' => 300, 'pro' => 3000], trial: 50);   // …set here, in the currency of the records
+WarpSaas::meter('input.form_fill')->label('Fill a form from pasted text (AI)');
+```
+
+Then run `php artisan warp-saas:ai-check`. It stops when a model has no price, the provider key is missing or a plan in `plans` does not exist.
+
+| Setting (`filament-warp-saas.ai.*`) | What it does |
+| --- | --- |
+| `provider` | The Laravel AI provider (`anthropic`, `openai`, `gemini`, …). Default `anthropic`. |
+| `models.fast`, `models.smart` | The model of each tier. When one is empty the other is used. Both empty: no gateway. |
+| `vision_models.fast`, `.smart` | The model for a request with images or PDFs. Empty: the tier's model. |
+| `prices` | USD per million tokens: `input`, `output`, `cache_read`, `cache_write`, and `long` for a price above a number of input tokens. Anthropic's current models are filled in (2026-11-03). **A model without a price is refused** (the use is not made), so nothing is counted at no cost. |
+| `currency_rate` | USD → the currency of the records. The row keeps the USD amount too (`meta.ai.usd`). |
+| `plans` | The meters each plan may use, with the monthly limit (`null` = no limit, `'*'` = every meter). A plan that is not listed may use no AI. Empty: every plan may use every meter, with the limits you set with `WarpSaas::meter()`. |
+| `trial_limit` | The monthly limit of each AI meter for a team on trial. `null`: the plan's. |
+| `budget_meter` | A meter whose money budget every AI meter shares (`sharesBudgetWith()`). |
+| `allow_without_tenant` | `false` (default): a request outside a team (an operator page, a command) is refused, because it cannot be counted. `true`: it is made without a seat or a record; listen to `AiUsed` to count it yourself. |
+| `timeout` | Seconds to wait for the provider (default 60). |
+| `admin_keys.anthropic`, `.openai` | Admin keys for `warp-saas:ai-reconcile` only. |
+
+### What happens on each use
+
+1. **A team is needed.** The team is the request's `tenant` (a queued job passes the team of the record), or the current team.
+2. **The plan must allow the meter** (`plans`). The meter is `<plugin>.<feature>` (`input.form_fill`), or the name the app gives the feature in the plugin (`->aiFeature('order_intake')`).
+3. **A seat is taken** with the estimate: the length of the input (one token per three characters), the files (1,600 tokens an image, 50 a KB of a PDF) and the **whole** output limit of the feature, at the model's price. Near the end of a budget the gateway stops a little early rather than late.
+4. **The provider is called** with the instructions, the input, the files and the JSON schema of the answer (structured output), the output limit of the feature, and a hash of the team in `metadata.user_id` (Anthropic) or `safety_identifier` (OpenAI) — never a name or an email.
+5. **The real cost** (input, cache reads and writes, output, at the price table, times `currency_rate`) replaces the estimate. The row's `meta.ai` keeps the plugin, feature, tier, provider, model, USD and token counts.
+6. **When it fails** after the provider was paid (an answer that is not in the schema), the cost is kept with 0 uses; when nothing is known to be paid, the seat is removed. The plugin gets an exception with `userMessage()`, a sentence in the user's language, and shows it instead of an error page.
+
+A plugin asks `app('warp.ai')->unavailable([...])` before it shows or enables a button. It counts nothing (not even the per-minute count) and returns `null` or the sentence to show: the plan does not include it, the monthly limit, the budget.
+
+### Checking the cost and the models
+
+| Command | What it does |
+| --- | --- |
+| `warp-saas:ai-check` | Checks the settings (above). Sends nothing to the provider. |
+| `warp-saas:ai-reconcile {--month=2026-11} {--provider=}` | Compares the recorded USD of a month (UTC) with the provider's cost API: Anthropic's Usage and Cost Analytics API (falls back to the older cost report), OpenAI's Costs API. Needs an admin key; without one it shows only the recorded cost. The provider cannot split the cost per team, so the per-team numbers are Warp SaaS's records. Compare in a workspace (or project) that only the gateway uses. The providers can be a day late and revise a month for about a week. |
+| `warp-ai:eval {plugin.feature} {--model=} {--case=}` | Runs a plugin's AI cases (`tests/ai-cases/<feature>.json`, where the plugin's folder is in `config('warp.ai.cases.<plugin>')`) against the real model and counts the matching values. Run it before changing a model and after changing a prompt. It costs money, so not in CI; it is not metered. |
+
+### Testing your app
+
+```php
+use Qalainau\FilamentWarpSaas\WarpSaas;
+
+$ai = WarpSaas::fakeAi(fn (array $request) => [
+    'data' => ['fields' => ['customer' => 'Harbor Supply Co.']],
+    'usage' => ['input_tokens' => 900, 'output_tokens' => 120],   // optional: the cost to record
+]);
+
+// … press the plugin's AI button in your Livewire test …
+
+$ai->assertAsked(fn (array $request) => $request['plugin'] === 'input' && $request['feature'] === 'form_fill');
+```
+
+The gateway stays real — the team, the plan, the seat and the record — and only the provider is replaced. `fakeAi()` works without any model set. Throw from the function to test a provider error (`new AiCallFailed('…', usage: [...])` keeps its cost). To go through Laravel AI itself instead, use `GatewayAgent::fake([...])`.
+
+### Good to know
+
+- **The answer is data, never instructions.** The input and files are written by your users, so an answer is only used as values of the schema. A plugin checks the shape and drops what does not fit.
+- **Changing a model:** set `WARP_AI_MODEL_FAST`/`SMART`, add its price if it is not in the table, run `warp-saas:ai-check`, then `warp-ai:eval` for the features you use.
+- `AiUsed` is dispatched after every call (`succeeded` false when it failed). Its `request` holds what the user wrote: do not log it as is.
+- Your own gateway: bind `warp.ai` yourself (`$this->app->singleton('warp.ai', MyGateway::class)`) and Warp SaaS leaves it alone.
 
 ## Operator panel
 
@@ -1723,6 +1859,7 @@ Dispatched with Laravel's event dispatcher (`Event::listen`, a listener class, `
 | `TenantDeleting` | `tenant` | A deletion starts. |
 | `TenantDeleted` | `tenantType`, `tenantKey`, `tenantName`, `counts` | A deletion is done. The model no longer exists. |
 | `ServiceBudgetReached` | `trial`, `budget`, `spent`, `month` | A service-wide budget is reached (once per month and budget). |
+| `AiUsed` | `request`, `tenant`, `model`, `usage`, `usd`, `succeeded` | The [AI gateway](#ai-gateway) called the provider (also when the call failed). |
 | `ChargeCreated` | `tenant`, `charge` | An invoice was made (`activate()`, `warp-saas:bill`, `charge()`), after `issueInvoiceUsing()` and before the mail. |
 | `ChargePaid` | `tenant`, `charge` | `markPaid()`. |
 | `ChargeVoided` | `tenant`, `charge` | `voidCharge()`. |
@@ -1746,6 +1883,7 @@ Put these on the scheduler of your app (`routes/console.php`). Warp SaaS does no
 | `warp-saas:purge {--dry-run} {--force}` | Deletes ended teams whose retention period is over. | `->daily()` with `--force` |
 | `warp-saas:prune-invitations {--days=30}` | Deletes invitations that expired more than N days ago and were never accepted. | `->daily()` |
 | `warp-saas:prune-usages {--months=13}` | Deletes usage records older than N months, counting this month. | `->monthly()` |
+| `warp-saas:ai-check`, `warp-saas:ai-reconcile`, `warp-ai:eval` | See [AI gateway](#ai-gateway). | `ai-reconcile` monthly, after the 7th |
 | `warp-saas:check-references {--table=}` | Finds rows that point to another team's rows. Exit code 1 when it finds one. | Before deploys, or `->daily()` |
 | `warp-saas:export {tenant}` | Writes the zip of one team now and prints where. | By hand |
 | `warp-saas:delete {tenant} {--force} {--now}` | Deletes one ended team. `{tenant}` is its slug or key. | By hand |

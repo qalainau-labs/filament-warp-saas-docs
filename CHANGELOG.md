@@ -4,6 +4,23 @@ All notable changes to `qalainau/filament-warp-saas` are documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
+### Added
+
+- **AI gateway** (`app('warp.ai')`): the AI features of the Warp plugins ask Warp SaaS instead of a provider. It checks the team and its plan (`filament-warp-saas.ai.plans`), takes a seat with an estimate, calls the model of the tier with Laravel AI (`laravel/ai` is now required), records the real cost from the tokens and the price table, and keeps the cost of a failed call. Bound only when a model is set in the new config file. Commands `warp-saas:ai-check`, `warp-saas:ai-reconcile` (the providers' cost APIs) and `warp-ai:eval` (a plugin's AI cases against the real model); `WarpSaas::fakeAi()` for your tests; event `AiUsed`.
+- `Meter::unavailableReason()`: whether the meter can be used now, without counting anything.
+- **Seats for usage meters:** `Meter::reserve($tenant, $user, quantity: 1, estimate: 0)` checks the limits and takes the seat at once, under a cache lock per team and budget, and returns a `Reservation` (`complete(cost:, meta:)`, `fail(?cost)`, `cost()`). The budget check adds the estimate (`cost + estimate > budget`; with no estimate it is `≥` as before). `attempt()` accepts `estimate:` and passes the `Reservation` to the callback.
+
+### Fixed
+
+- **Many uses at the same moment no longer end in an error page:** when several people of the same company use a meter at once and one of them does not get the meter's lock within `Meter::$lockWaitSeconds` (5), `reserve()` and `attempt()` now throw `UsageBusy` (extends `LockTimeoutException`, a 503 with a “wait a moment and try again” message) instead of a bare `LockTimeoutException` (a 500). The AI gateway turns it into `AiUnavailable` with the reason `busy`, so plugins show that sentence. Translated into all 10 languages.
+- **The AI gateway sent nested objects with no fields:** a plugin that wrote the `properties` of a nested object as `(object) [...]` (so an empty one is `{}` in JSON) had those fields dropped by Laravel AI's schema reader, so the model saw an empty object and filled nothing (Warp Input's Smart Paste, Warp Table's AI filter). The schema is now read through JSON first.
+- **Usage meters let several uses at the same moment pass the last one:** `attempt()` checked, then called the API, then recorded, with no seat taken in between, so a team with 1 use left that pressed the button 8 times at once used 8. `attempt()` now takes a seat with `reserve()` first (it needs a cache store with locks; the `null` store throws a `LogicException`). `ensureAvailable()` and `record()` are unchanged.
+- **Usage meters lost the cost of a failed use:** when the callback of `attempt()` threw after the provider had already charged (the answer could not be read, a timeout), nothing was recorded. A cost reported with `$reservation->cost(…)` is now kept with 0 uses, so it counts toward the budget.
+
+- The tenant data map now knows `warp_scheduler_task_segments` (the split task parts of Warp Scheduler 1.18.0's `taskSplitting()`): its rows belong to the company of the task that owns them, like the other Warp Scheduler tables. Before, apps that check every table is classified failed once the table existed.
+
 ## [0.1.1] - 2026-11-22
 
 ### Fixed
